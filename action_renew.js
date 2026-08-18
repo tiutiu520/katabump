@@ -319,46 +319,103 @@ async function attemptTurnstileCdp(page) {
                 await pwdInput.fill(user.password);
                 await page.waitForTimeout(500);
 
-                // Turnstile 绕过
-                console.log('   >> 正在登录前检查 Turnstile (使用 CDP 绕过)...');
-                let cdpClickResult = false;
-                for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
-                    cdpClickResult = await attemptTurnstileCdp(page);
-                    if (cdpClickResult) break;
-                    await page.waitForTimeout(1000);
-                }
-                if (cdpClickResult) {
-                    console.log('   >> 登录 CDP 点击生效。正在等待最多 10秒 Cloudflare 成功标志...');
-                    for (let waitSec = 0; waitSec < 10; waitSec++) {
-                        const frames = page.frames();
-                        let isSuccess = false;
-                        for (const f of frames) {
-                            if (f.url().includes('cloudflare')) {
-                                try {
-                                    if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                        isSuccess = true;
-                                        break;
-                                    }
-                                } catch (e) { }
-                            }
-                        }
-                        if (isSuccess) {
-                            console.log('   >> 登录前 Turnstile 验证成功。');
-                            break;
-                        }
-                        await page.waitForTimeout(1000);
+               // ===== Turnstile 绕过（增强版） =====
+console.log('   >> 正在登录前检查 Turnstile (使用 CDP 绕过)...');
+let turnstileVerified = false;
+let retryCount = 0;
+const maxRetries = 3;
+
+while (!turnstileVerified && retryCount < maxRetries) {
+    retryCount++;
+    console.log(`   >> 尝试 ${retryCount}/${maxRetries} 寻找并点击 Turnstile...`);
+
+    // 1. 寻找并点击复选框（最多 15 次）
+    let cdpClickResult = false;
+    for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
+        cdpClickResult = await attemptTurnstileCdp(page);
+        if (cdpClickResult) break;
+        await page.waitForTimeout(1000);
+    }
+
+    if (!cdpClickResult) {
+        console.log('   >> 未找到 Turnstile 复选框，可能未出现，继续尝试...');
+        // 如果找不到，可能页面尚未加载，刷新或等待
+        await page.waitForTimeout(2000);
+        continue;
+    }
+
+    console.log('   >> CDP 点击已发送，等待 Cloudflare 验证完成...');
+    // 2. 等待 "Success!" 标志（最多 20 秒）
+    let successDetected = false;
+    for (let waitSec = 0; waitSec < 20; waitSec++) {
+        const frames = page.frames();
+        for (const f of frames) {
+            if (f.url().includes('cloudflare')) {
+                try {
+                    if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
+                        successDetected = true;
+                        break;
                     }
-                } else {
-                    console.log('   >> 登录前未检测到或未点击 Turnstile，继续操作...');
-                }
+                } catch (e) { }
+            }
+        }
+        if (successDetected) break;
+        await page.waitForTimeout(1000);
+    }
 
-                // 点击登录
-                await page.getByRole('button', { name: 'Login', exact: true }).click();
+    if (successDetected) {
+        console.log('   >> ✅ Turnstile 验证成功！');
+        turnstileVerified = true;
+    } else {
+        console.log('   >> ⚠️ 未检测到 Success!，可能验证失败，刷新页面重试...');
+        await page.reload();
+        await page.waitForTimeout(3000);
+        // 重新填写表单（因为刷新后需重新输入）
+        const emailInput = page.getByRole('textbox', { name: 'Email' });
+        await emailInput.waitFor({ state: 'visible', timeout: 5000 });
+        await emailInput.fill(user.username);
+        const pwdInput = page.getByRole('textbox', { name: 'Password' });
+        await pwdInput.fill(user.password);
+        await page.waitForTimeout(500);
+    }
+}
 
-                // ===== 新增：等待导航到仪表盘 =====
-                console.log('等待导航到仪表盘...');
-                await page.waitForURL('**/dashboard', { timeout: 15000 });
-                console.log('仪表盘已加载。');
+if (!turnstileVerified) {
+    console.log('   >> ❌ 多次尝试后 Turnstile 仍未通过，跳过此用户。');
+    continue;
+}
+
+// ===== 点击登录按钮 =====
+await page.getByRole('button', { name: 'Login', exact: true }).click();
+console.log('登录按钮已点击，等待导航...');
+
+// ===== 等待导航（增加超时到 30 秒） =====
+try {
+    await page.waitForURL('**/dashboard', { timeout: 30000 });
+    console.log('仪表盘已加载。');
+} catch (e) {
+    // 检查是否出现错误信息
+    const errorMsg = page.getByText('Incorrect password or no account');
+    if (await errorMsg.isVisible({ timeout: 2000 })) {
+        console.error(`   >> ❌ 登录失败: 用户 ${user.username} 账号或密码错误`);
+        // 截图并通知
+        const photoDir = path.join(process.cwd(), 'screenshots');
+        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+        const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
+        const shotPath = path.join(photoDir, `${safeUser}_login_fail.png`);
+        await page.screenshot({ path: shotPath, fullPage: true });
+        await sendTelegramMessage(`❌ *登录失败*\n用户: ${user.username}\n原因: 账号或密码错误`, shotPath);
+        continue;
+    }
+    // 其他错误
+    console.error('导航超时，可能验证未通过或页面加载慢。');
+    const photoDir = path.join(process.cwd(), 'screenshots');
+    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+    await page.screenshot({ path: path.join(photoDir, 'login_timeout.png'), fullPage: true });
+    continue;
+}
+
+// 后续检查错误信息（原代码中有重复，可保留）
 
                 // ===== 检查错误信息 =====
                 try {
