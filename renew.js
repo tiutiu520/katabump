@@ -396,42 +396,92 @@ async function attemptTurnstileCdp(page) {
                 }
                 // --------------------------------------------
 
+                // ===== 点击登录按钮 =====
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
-                // User Request: Check for "Incorrect password or no account"
-                try {
-                    const errorMsg = page.getByText('Incorrect password or no account');
-                    if (await errorMsg.isVisible({ timeout: 3000 })) {
-                        console.error(`   >> ❌ Login failed: Incorrect password or no account for user ${user.username}`);
+                // ===== 等待登录导航完成 =====
+                console.log('Waiting for navigation to dashboard...');
+                await page.waitForURL('**/dashboard', { timeout: 15000 });
+                console.log('Dashboard loaded.');
 
-                        // Screenshot for login failure
+                // ===== 检查是否出现错误信息（有时登录失败会仍停留在登录页） =====
+                try {
+                    // 短暂等待，让错误信息可能渲染出来
+                    await page.waitForTimeout(1000);
+                    const errorMsg = page.getByText('Incorrect password or no account');
+                    if (await errorMsg.isVisible({ timeout: 2000 })) {
+                        console.error(`   >> ❌ Login failed: Incorrect password or no account for user ${user.username}`);
                         const photoDir = path.join(__dirname, 'photo');
                         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
                         try { await page.screenshot({ path: path.join(photoDir, `${user.username}.png`), fullPage: true }); } catch (e) { }
-
-                        // Skip to next user
-                        continue;
+                        continue; // 跳过当前用户
                     }
-                } catch (e) { }
+                } catch (e) { /* 没有错误信息，正常继续 */ }
+
+                // ===== 等待表格数据加载完成 =====
+                try {
+                    await page.waitForSelector('table tbody tr', { timeout: 10000 });
+                    console.log('Server table loaded.');
+                } catch (e) {
+                    console.log('Table not loaded within timeout. Current URL:', page.url());
+                    // 可截图供调试
+                    const photoDir = path.join(__dirname, 'photo');
+                    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+                    await page.screenshot({ path: path.join(photoDir, 'table_not_loaded.png'), fullPage: true });
+                    continue; // 跳过此用户
+                }
+
+                // ===== 查找并点击 "See" 链接（多种备选定位方式） =====
+                console.log('Looking for "See" link...');
+                let seeClicked = false;
+
+                // 尝试方式1：基于文本精确匹配（推荐）
+                const seeLink = page.locator('table a:has-text("See")').first();
+                try {
+                    await seeLink.waitFor({ state: 'visible', timeout: 10000 });
+                    await seeLink.click();
+                    seeClicked = true;
+                    console.log('Clicked "See" link (method 1).');
+                } catch (e1) {
+                    console.log('Method 1 failed, trying getByRole...');
+                    // 方式2：基于 role
+                    try {
+                        const seeLink2 = page.getByRole('link', { name: 'See' }).first();
+                        await seeLink2.waitFor({ state: 'visible', timeout: 5000 });
+                        await seeLink2.click();
+                        seeClicked = true;
+                        console.log('Clicked "See" link (method 2).');
+                    } catch (e2) {
+                        console.log('Method 2 also failed. Check if already on detail page or login failed.');
+                        // 如果已经在详情页（URL 包含 /server/ 之类），则无需点击 See
+                        if (!page.url().includes('/server/')) {
+                            // 截图记录
+                            const photoDir = path.join(__dirname, 'photo');
+                            if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+                            await page.screenshot({ path: path.join(photoDir, 'see_not_found.png'), fullPage: true });
+                            console.error('Could not find "See" link. Skipping user.');
+                            continue;
+                        }
+                        // 若已在详情页，视为成功
+                        seeClicked = true;
+                        console.log('Already on detail page, no need to click "See".');
+                    }
+                }
+
+                if (!seeClicked) {
+                    console.log('Failed to click "See" or navigate to detail. Skipping user.');
+                    continue;
+                }
+
+                // ===== 点击“See”后，进入 Renew 主循环 =====
+                // 原代码中的 for (let attempt = 1; attempt <= 20; attempt++) 开始
 
             } catch (e) {
                 // 可能已经登录了，或者是其他 UI 状态
                 console.log('Login form interaction error (maybe already logged in?):', e.message);
             }
 
-            console.log('Waiting for "See" link...');
-            try {
-                await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
-                await page.waitForTimeout(1000);
-                await page.getByRole('link', { name: 'See' }).first().click();
-            } catch (e) {
-                console.log('Could not find "See" button. Checking if already on detail page or login failed.');
-                if (page.url().includes('login')) {
-                    console.error('Login failed for user ' + user.username);
-                    continue;
-                }
-            }
-
+            // 原来的 Renew 循环（从这开始保持不变）
             let renewSuccess = false;
             // 2. 一个扁平化的主循环：尝试 Renew 整个流程 (最多 20 次)
             for (let attempt = 1; attempt <= 20; attempt++) {
